@@ -5,67 +5,21 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { TrendingUp, Target, DollarSign, Clock, BarChart3, Loader2 } from "lucide-react"
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer, ReferenceLine, Scatter, Tooltip, Legend } from "recharts"
-import Plot from 'react-plotly.js';
+import { TrendingUp, Target, BarChart3, Loader2 } from "lucide-react"
+import Plot from 'react-plotly.js'
 
-const INTERVALS = ["5m", "15m", "1h"];
-const PERIOD_MAP = { "5m": "30d", "15m": "30d", "1h": "60d" };
+const INTERVALS = ["1h", "4h"]
+const PERIOD_MAP = { "1h": "15d", "4h": "30d" }
 
-function formatDateLikeOHLCV(date: Date) {
-  return date.getFullYear() + '-' +
-    String(date.getMonth() + 1).padStart(2, '0') + '-' +
-    String(date.getDate()).padStart(2, '0') + ' ' +
-    String(date.getHours()).padStart(2, '0') + ':' +
-    String(date.getMinutes()).padStart(2, '0') + ':' +
-    String(date.getSeconds()).padStart(2, '0');
-}
-
-function getNextMarketTime(last: Date, offsetMinutes: number) {
-  // US market hours: 9:30am to 4:00pm
-  const MARKET_OPEN_HOUR = 9;
-  const MARKET_OPEN_MIN = 30;
-  const MARKET_CLOSE_HOUR = 16;
-  const MARKET_CLOSE_MIN = 0;
-  let next = new Date(last.getTime() + offsetMinutes * 60 * 1000);
-  // Check if next is after market close
-  if (
-    next.getHours() > MARKET_CLOSE_HOUR ||
-    (next.getHours() === MARKET_CLOSE_HOUR && next.getMinutes() > MARKET_CLOSE_MIN)
-  ) {
-    // Move to next day 9:30am
-    next.setDate(next.getDate() + 1);
-    next.setHours(MARKET_OPEN_HOUR, MARKET_OPEN_MIN, 0, 0);
-  }
-  // If before market open, set to 9:30am
-  if (
-    next.getHours() < MARKET_OPEN_HOUR ||
-    (next.getHours() === MARKET_OPEN_HOUR && next.getMinutes() < MARKET_OPEN_MIN)
-  ) {
-    next.setHours(MARKET_OPEN_HOUR, MARKET_OPEN_MIN, 0, 0);
-  }
-  return next;
-}
-
-// Helper to check if now is between 9:25am and 4:05pm US Eastern
 function isWithinMarketRefreshWindow() {
-  // Get current time in UTC
-  const now = new Date();
-  // Convert to US Eastern Time (handles DST)
-  const easternOffset = -5 * 60; // EST is UTC-5, but this does not handle DST
-  // Use Intl API for robust conversion
-  const easternNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const hour = easternNow.getHours();
-  const min = easternNow.getMinutes();
-  // 9:25am = 9*60+25 = 565, 4:05pm = 16*60+5 = 965
-  const mins = hour * 60 + min;
-  return mins >= 565 && mins <= 965;
+  const easternNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }))
+  const mins = easternNow.getHours() * 60 + easternNow.getMinutes()
+  return mins >= 565 && mins <= 965 // 9:25am–4:05pm ET
 }
 
 export default function MurliTradingApp() {
   const [tickerSymbol, setTickerSymbol] = useState("SPY")
-  const [activeTimeframe, setActiveTimeframe] = useState("15m")
+  const [activeTimeframe, setActiveTimeframe] = useState("1h")
   const [backendData, setBackendData] = useState<any>(null)
   const [isUserLoading, setIsUserLoading] = useState(false)
   const [isAutoRefreshing, setIsAutoRefreshing] = useState(false)
@@ -82,7 +36,7 @@ export default function MurliTradingApp() {
       })
       const data = await res.json()
       setBackendData(data)
-    } catch (err) {
+    } catch {
       setBackendData(null)
     } finally {
       if (triggeredByUser) setIsUserLoading(false)
@@ -90,107 +44,116 @@ export default function MurliTradingApp() {
     }
   }, [])
 
-  // Polling every 10 seconds (background, no spinner)
   useEffect(() => {
     fetchAll(false)
-    const interval = setInterval(() => {
-      if (isWithinMarketRefreshWindow()) {
-        fetchAll(false)
-      }
-    }, 10000)
-    return () => clearInterval(interval)
+    const id = setInterval(() => { if (isWithinMarketRefreshWindow()) fetchAll(false) }, 60000)
+    return () => clearInterval(id)
   }, [fetchAll])
 
-  // Handler for manual refresh
-  const handleManualRefresh = () => {
-    fetchAll(true)
-  }
-
-  // Handler for ticker change
   const handleTickerChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setTickerSymbol(e.target.value)
     tickerRef.current = e.target.value
-    fetchAll(true)
   }
 
   const consensus = backendData?.consensus
   const intervals = backendData?.intervals || {}
   const activeData = intervals[activeTimeframe] || {}
 
-  // Debug: log ohlcv, peaks, and troughs for all intervals
-  if (typeof window !== 'undefined' && backendData?.intervals) {
-    ['5m', '15m', '1h'].forEach(ivl => {
-      const d = backendData.intervals[ivl] || {};
-      console.log(`${ivl} ohlcv length:`, (d.ohlcv || []).length);
-      console.log(`${ivl} ohlcv sample:`, (d.ohlcv || []).slice(0, 3));
-      console.log(`${ivl} peaks:`, d.peaks);
-      console.log(`${ivl} troughs:`, d.troughs);
-    });
-  }
-  // Debug: log last 5 Close prices for the active interval
-  if (typeof window !== 'undefined' && activeData.ohlcv) {
-    console.log('Last 5 Close prices:', activeData.ohlcv.slice(-5).map((d: any) => d.Close));
+  const rrColor = (rr: number | null | undefined) => {
+    if (rr == null) return "text-neutral-400"
+    if (rr >= 2) return "text-emerald-400"
+    if (rr >= 1) return "text-yellow-400"
+    return "text-rose-400"
   }
 
   return (
     <div className="min-h-screen bg-black text-white">
       <div className="p-6 space-y-6">
-        {/* Header with Ticker Input */}
-        <div className="flex items-center justify-between">
+
+        {/* Header */}
+        <div className="flex items-center justify-between flex-wrap gap-4">
           <div className="flex items-center space-x-3">
             <div className="w-8 h-8 bg-rose-500 rounded flex items-center justify-center">
               <BarChart3 className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-3xl font-bold">MURLI by sm0h</h1>
           </div>
-
-          <div className="flex items-center space-x-4">
-            <div className="flex items-center space-x-2">
-              <label className="text-sm text-neutral-300">Ticker Symbol:</label>
-              <Input
-                value={tickerSymbol}
-                onChange={handleTickerChange}
-                className="bg-neutral-800 border-neutral-600 text-white w-24"
-                placeholder="SPY"
-              />
-            </div>
-            <Button className="bg-purple-600 hover:bg-purple-700" onClick={handleManualRefresh} disabled={isUserLoading}>
+          <div className="flex items-center space-x-3">
+            <label className="text-sm text-neutral-300">Ticker:</label>
+            <Input
+              value={tickerSymbol}
+              onChange={handleTickerChange}
+              className="bg-neutral-800 border-neutral-600 text-white w-24"
+              placeholder="SPY"
+            />
+            <Button
+              className="bg-purple-600 hover:bg-purple-700"
+              onClick={() => fetchAll(true)}
+              disabled={isUserLoading}
+            >
               <TrendingUp className="w-4 h-4 mr-2" />
-              {isUserLoading ? "Loading..." : "Run Pivot Prediction"}
+              {isUserLoading ? "Loading…" : "Run Prediction"}
             </Button>
+            {isAutoRefreshing && <Loader2 className="animate-spin text-neutral-400" size={18} />}
           </div>
         </div>
 
-        {/* Consensus Summary */}
+        {/* Signal Card */}
         <Card className="bg-neutral-900 border-neutral-700">
           <CardHeader>
             <CardTitle className="flex items-center space-x-2">
               <Target className="w-4 h-4 text-pink-500" />
-              <span>Consensus</span>
-              {isAutoRefreshing && (
-                <Loader2 className="animate-spin text-neutral-400 ml-2" size={20} />
-              )}
+              <span>Signal</span>
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {consensus ? (
-              <div className="space-y-2">
-                <div className="text-lg font-bold">{consensus.type}</div>
-                {consensus.avg_entry !== undefined && (
-                  <div className="flex space-x-6 text-sm">
-                    <span>Avg Entry: <span className="text-emerald-400 font-mono">${consensus.avg_entry?.toFixed(2)}</span></span>
-                    <span>Avg Exit: <span className="text-emerald-400 font-mono">${consensus.avg_exit?.toFixed(2)}</span></span>
-                    <span>Risk/Reward: <span className="text-rose-400 font-mono">{consensus.risk_reward?.toFixed(2)}</span></span>
+            {!consensus ? (
+              <p className="text-neutral-400">Run prediction to see a signal.</p>
+            ) : consensus.is_trade ? (
+              <div className={`rounded-lg border-2 p-5 ${consensus.signal === "CALL"
+                ? "border-emerald-500 bg-emerald-950/30"
+                : "border-rose-500 bg-rose-950/30"}`}>
+                <div className="text-2xl font-bold mb-3">
+                  {consensus.signal === "CALL" ? "📈 BUY CALL" : "📉 BUY PUT"}
+                  {" — "}
+                  {tickerRef.current.toUpperCase()} ${consensus.strike} Strike
+                </div>
+                <div className="text-sm text-neutral-300 mb-4">
+                  {consensus.signal === "CALL" ? "Expecting price to rise" : "Expecting price to fall"} toward ${consensus.tp?.toFixed(2)}
+                  {" · "}{consensus.agreeing} timeframes agree
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                  <div>
+                    <div className="text-neutral-400 mb-1">Entry</div>
+                    <div className="text-xl font-mono font-semibold">${consensus.avg_entry?.toFixed(2)}</div>
                   </div>
-                )}
+                  <div>
+                    <div className="text-neutral-400 mb-1">Strike</div>
+                    <div className="text-xl font-mono font-semibold">${consensus.strike}</div>
+                  </div>
+                  <div>
+                    <div className="text-neutral-400 mb-1">Stop Loss</div>
+                    <div className="text-xl font-mono font-semibold text-rose-400">${consensus.sl?.toFixed(2)}</div>
+                  </div>
+                  <div>
+                    <div className="text-neutral-400 mb-1">Take Profit</div>
+                    <div className="text-xl font-mono font-semibold text-emerald-400">${consensus.tp?.toFixed(2)}</div>
+                  </div>
+                </div>
+                <div className={`mt-3 text-sm font-semibold ${rrColor(consensus.risk_reward)}`}>
+                  R/R Ratio: {consensus.risk_reward != null ? consensus.risk_reward.toFixed(2) : "—"}
+                </div>
               </div>
             ) : (
-              <div>No consensus data.</div>
+              <div className="rounded-lg border-2 border-yellow-600 bg-yellow-950/20 p-5">
+                <div className="text-2xl font-bold mb-2">⚠️ No Trade</div>
+                <div className="text-neutral-300 text-sm">{consensus.reason || "Mixed signals — wait for timeframes to align."}</div>
+              </div>
             )}
           </CardContent>
         </Card>
 
-        {/* Interval Tabs */}
+        {/* Timeframe tabs */}
         <Tabs value={activeTimeframe} onValueChange={setActiveTimeframe}>
           <TabsList className="bg-neutral-800">
             {INTERVALS.map((ivl) => (
@@ -201,281 +164,160 @@ export default function MurliTradingApp() {
           </TabsList>
         </Tabs>
 
-        {/* Interval Details */}
+        {/* Per-interval detail */}
         <Card className="bg-neutral-900 border-neutral-700">
           <CardHeader>
-            <CardTitle className="flex items-center space-x-2">
-              <Clock className="w-5 h-5 text-neutral-400" />
-              <span>{activeTimeframe} Pivot Prediction</span>
-            </CardTitle>
+            <div className="flex items-center justify-between w-full">
+              <CardTitle>{activeTimeframe} — {tickerRef.current.toUpperCase()}</CardTitle>
+              <div className="text-xs text-neutral-400 space-x-4">
+                <span>ATR: <span className={activeData.low_volatility ? "text-yellow-300" : "text-white"}>
+                  {activeData.atr != null ? activeData.atr.toFixed(3) : "—"}
+                </span></span>
+                <span>ATR/Close: <span className="text-white">
+                  {activeData.atr_ratio != null ? (activeData.atr_ratio * 100).toFixed(2) + "%" : "—"}
+                </span></span>
+              </div>
+            </div>
           </CardHeader>
           <CardContent>
-            {activeData.prediction ? (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {activeData.prediction && activeData.prediction.predicted_type_name !== "Unknown" ? (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 text-sm">
                 <div>
-                  <div className="text-sm text-neutral-400 mb-1">Pivot Type</div>
-                  <div className="text-2xl font-bold flex items-center">
+                  <div className="text-neutral-400 mb-1">Signal</div>
+                  <div className="text-lg font-bold flex items-center gap-1">
                     {activeData.prediction.predicted_type_name}
                     {activeData.macd_tick && (
-                      <span className="text-white font-bold ml-2" title="MACD agrees">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="inline w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                      </span>
+                      <span className="text-emerald-400" title="MACD confirms">✓</span>
                     )}
                   </div>
                 </div>
                 <div>
-                  <div className="text-sm text-neutral-400 mb-1">Confidence</div>
-                  <div className="text-2xl font-bold text-emerald-400">{(activeData.prediction.confidence * 100).toFixed(1)}%</div>
+                  <div className="text-neutral-400 mb-1">Confidence</div>
+                  <div className="text-lg font-bold text-emerald-400">
+                    {(activeData.prediction.confidence * 100).toFixed(0)}%
+                  </div>
                 </div>
                 <div>
-                  <div className="text-sm text-neutral-400 mb-1">Target Price</div>
-                  <div className="text-2xl font-bold">${activeData.prediction.estimated_value?.toFixed(2)}</div>
+                  <div className="text-neutral-400 mb-1">Target Price</div>
+                  <div className="text-lg font-bold">${activeData.prediction.estimated_value?.toFixed(2)}</div>
                 </div>
                 <div>
-                  <div className="text-sm text-neutral-400 mb-1">Projected Time (ET)</div>
-                  <div className="text-2xl font-bold">{activeData.projected_time_et || '-'}</div>
+                  <div className="text-neutral-400 mb-1">Projected (ET)</div>
+                  <div className="text-lg font-bold">{activeData.projected_time_et || "—"}</div>
                 </div>
               </div>
             ) : (
-              <div>No prediction data available.</div>
+              <p className="text-neutral-400 mb-4 text-sm">No valid signal for {activeTimeframe} — showing chart only.</p>
             )}
-            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-              <div>
-                <span className="text-neutral-400">Entry:</span> <span className="font-mono">${activeData.entry?.toFixed(2)}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Exit Target:</span> <span className="font-mono">${activeData.exit_target?.toFixed(2)}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Support:</span> <span className="font-mono">${activeData.support?.toFixed(2)}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Resistance:</span> <span className="font-mono">${activeData.resistance?.toFixed(2)}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Risk/Reward:</span> <span className="font-mono">{activeData.risk_reward !== undefined ? activeData.risk_reward?.toFixed(2) : "-"}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Valid Setup:</span> <span className={activeData.is_valid ? "text-emerald-400" : "text-rose-400"}>{activeData.is_valid ? "Yes" : "No"}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Latest Price:</span> <span className="font-mono">${activeData.latest_price?.toFixed(2)}</span>
-              </div>
-              <div>
-                <span className="text-neutral-400">Timestamp:</span> <span className="font-mono">{activeData.latest_timestamp}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
 
-        {/* Chart Section */}
-        <Card className="bg-neutral-900 border-neutral-700">
-          <CardHeader>
-            <div className="flex items-center justify-between w-full">
-              <CardTitle>Price & Wave Chart ({activeTimeframe})</CardTitle>
-              <div className="flex flex-col items-end text-xs text-neutral-300 space-y-0.5">
-                <span title="Average True Range (ATR)">
-                  <span className={activeData.low_volatility ? 'font-mono text-yellow-300 flex items-center' : 'font-mono text-white flex items-center'}>
-                    ATR: {activeData.atr !== undefined && activeData.atr !== null ? activeData.atr.toFixed(3) : '-'}
-                    {activeData.low_volatility && <span className="ml-1" title="Low Volatility"><svg xmlns="http://www.w3.org/2000/svg" className="inline w-3 h-3 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9 9 4.03 9 9z" /></svg></span>}
-                  </span>
-                </span>
-                <span title="ATR / Close (Volatility Ratio)">
-                  ATR/Close: <span className="font-mono text-white">{activeData.atr_ratio !== undefined && activeData.atr_ratio !== null ? (activeData.atr_ratio * 100).toFixed(2) + '%' : '-'}</span>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm mb-4">
+              {[
+                ["Support", activeData.support],
+                ["Resistance", activeData.resistance],
+                ["Entry", activeData.entry],
+                ["Exit Target", activeData.exit_target],
+              ].map(([label, val]) => (
+                <div key={label as string}>
+                  <span className="text-neutral-400">{label}: </span>
+                  <span className="font-mono">{val != null ? `$${(val as number).toFixed(2)}` : "—"}</span>
+                </div>
+              ))}
+              <div>
+                <span className="text-neutral-400">R/R: </span>
+                <span className={`font-mono ${rrColor(activeData.risk_reward)}`}>
+                  {activeData.risk_reward != null ? activeData.risk_reward.toFixed(2) : "—"}
                 </span>
               </div>
+              <div>
+                <span className="text-neutral-400">Valid Setup: </span>
+                <span className={activeData.is_valid ? "text-emerald-400" : "text-rose-400"}>
+                  {activeData.is_valid ? "Yes" : "No"}
+                </span>
+              </div>
+              <div>
+                <span className="text-neutral-400">Price: </span>
+                <span className="font-mono">{activeData.latest_price != null ? `$${activeData.latest_price.toFixed(2)}` : "—"}</span>
+              </div>
+              <div>
+                <span className="text-neutral-400">As of: </span>
+                <span className="font-mono text-xs">{activeData.latest_timestamp || "—"}</span>
+              </div>
             </div>
-          </CardHeader>
-          <CardContent>
-            <div style={{ width: '100%', height: 350 }}>
+
+            {/* Chart */}
+            <div style={{ width: "100%", height: 380 }}>
               <Plot
                 data={[
-                  // Close price line
                   {
                     x: (activeData.ohlcv || []).map((d: any) => d.Date),
                     y: (activeData.ohlcv || []).map((d: any) => d.Close),
-                    type: 'scatter',
-                    mode: 'lines',
-                    name: 'Close Price',
-                    line: { color: '#8884d8', width: 2.5 },
-                    hovertemplate: '<span style="color:#fff;background:#222;padding:2px 6px;border-radius:4px"><b>$%{y:.2f}</b></span><extra></extra>',
+                    type: "scatter",
+                    mode: "lines",
+                    name: "Close",
+                    line: { color: "#818cf8", width: 2 },
                   },
-                  // Peaks (green upward triangles)
-                  ...(activeData.peaks && activeData.peaks.length > 0 ? [
-                    {
-                      x: activeData.peaks.map((idx: number) => activeData.ohlcv[idx]?.Date),
-                      y: activeData.peaks.map((idx: number) => activeData.ohlcv[idx]?.Close),
-                      type: 'scatter',
-                      mode: 'markers',
-                      name: 'Peaks',
-                      marker: { color: '#2ca02c', size: 12, symbol: 'triangle-up' },
-                      hovertemplate: '<span style="color:#fff;background:#22c55e;padding:2px 6px;border-radius:4px"><b>$%{y:.2f}</b></span><extra></extra>',
-                      showlegend: true,
-                    }
-                  ] : []),
-                  // Troughs (red downward triangles)
-                  ...(activeData.troughs && activeData.troughs.length > 0 ? [
-                    {
-                      x: activeData.troughs.map((idx: number) => activeData.ohlcv[idx]?.Date),
-                      y: activeData.troughs.map((idx: number) => activeData.ohlcv[idx]?.Close),
-                      type: 'scatter',
-                      mode: 'markers',
-                      name: 'Troughs',
-                      marker: { color: '#d62728', size: 12, symbol: 'triangle-down' },
-                      hovertemplate: '<span style="color:#fff;background:#ef4444;padding:2px 6px;border-radius:4px"><b>$%{y:.2f}</b></span><extra></extra>',
-                      showlegend: true,
-                    }
-                  ] : []),
-                  // Predicted next pivot dot (purple)
-                  ...((activeData.prediction && activeData.ohlcv && activeData.ohlcv.length > 0) ? (() => {
-                    const lastDateStr = activeData.ohlcv?.[activeData.ohlcv.length - 1]?.Date;
-                    let xValue = lastDateStr;
-                    if (lastDateStr) {
-                      // Parse as local time
-                      const last = new Date(lastDateStr.replace(' ', 'T'));
-                      let next;
-                      if (activeTimeframe === '5m' || activeTimeframe === '15m') {
-                        next = getNextMarketTime(last, 60); // 1 hour
-                      } else if (activeTimeframe === '1h') {
-                        next = getNextMarketTime(last, 900); // 15 hours
-                      } else {
-                        next = last;
-                      }
-                      xValue = formatDateLikeOHLCV(next);
-                      console.log('OHLCV Date:', lastDateStr, 'Dot xValue:', xValue);
-                    }
-                    return [{
-                      x: [xValue],
-                      y: [activeData.prediction.estimated_value],
-                      type: 'scatter',
-                      mode: 'markers',
-                      name: 'Next Pivot',
-                      marker: { color: '#a259e6', size: 18, symbol: 'circle', line: { color: '#fff', width: 2 } },
-                      hovertemplate: `${activeData.prediction.predicted_type_name} (Conf: ${(activeData.prediction.confidence * 100).toFixed(1)}%)<br>Price: $${activeData.prediction.estimated_value?.toFixed(2)}`,
-                      showlegend: true,
-                    }];
-                  })() : []),
-                  // Support line
-                  ...(activeData.support !== undefined ? [{
+                  ...(activeData.peaks?.length ? [{
+                    x: activeData.peaks.map((i: number) => activeData.ohlcv[i]?.Date),
+                    y: activeData.peaks.map((i: number) => activeData.ohlcv[i]?.Close),
+                    type: "scatter",
+                    mode: "markers",
+                    name: "Peaks",
+                    marker: { color: "#22c55e", size: 11, symbol: "triangle-up" },
+                  }] : []),
+                  ...(activeData.troughs?.length ? [{
+                    x: activeData.troughs.map((i: number) => activeData.ohlcv[i]?.Date),
+                    y: activeData.troughs.map((i: number) => activeData.ohlcv[i]?.Close),
+                    type: "scatter",
+                    mode: "markers",
+                    name: "Troughs",
+                    marker: { color: "#ef4444", size: 11, symbol: "triangle-down" },
+                  }] : []),
+                  ...(activeData.prediction?.estimated_value && activeData.ohlcv?.length ? [{
+                    x: [activeData.ohlcv[activeData.ohlcv.length - 1]?.Date],
+                    y: [activeData.prediction.estimated_value],
+                    type: "scatter",
+                    mode: "markers",
+                    name: `Next ${activeData.prediction.predicted_type_name}`,
+                    marker: { color: "#a78bfa", size: 16, symbol: "star", line: { color: "#fff", width: 1.5 } },
+                  }] : []),
+                  ...(activeData.support != null ? [{
                     x: (activeData.ohlcv || []).map((d: any) => d.Date),
                     y: Array((activeData.ohlcv || []).length).fill(activeData.support),
-                    type: 'scatter',
-                    mode: 'lines',
-                    name: 'Support',
-                    line: { color: '#3b82f6', width: 2, dash: 'dot' },
-                    hoverinfo: 'skip',
-                    showlegend: true,
+                    type: "scatter", mode: "lines", name: "Support",
+                    line: { color: "#3b82f6", width: 1.5, dash: "dot" }, hoverinfo: "skip",
                   }] : []),
-                  // Entry line
-                  ...(activeData.entry !== undefined ? [{
-                    x: (activeData.ohlcv || []).map((d: any) => d.Date),
-                    y: Array((activeData.ohlcv || []).length).fill(activeData.entry),
-                    type: 'scatter',
-                    mode: 'lines',
-                    name: 'Entry',
-                    line: { color: '#a259e6', width: 2, dash: 'dash' },
-                    hoverinfo: 'skip',
-                    showlegend: true,
-                  }] : []),
-                  // Resistance line
-                  ...(activeData.resistance !== undefined ? [{
+                  ...(activeData.resistance != null ? [{
                     x: (activeData.ohlcv || []).map((d: any) => d.Date),
                     y: Array((activeData.ohlcv || []).length).fill(activeData.resistance),
-                    type: 'scatter',
-                    mode: 'lines',
-                    name: 'Resistance',
-                    line: { color: '#ef4444', width: 2, dash: 'dot' },
-                    hoverinfo: 'skip',
-                    showlegend: true,
+                    type: "scatter", mode: "lines", name: "Resistance",
+                    line: { color: "#f87171", width: 1.5, dash: "dot" }, hoverinfo: "skip",
+                  }] : []),
+                  ...(activeData.entry != null ? [{
+                    x: (activeData.ohlcv || []).map((d: any) => d.Date),
+                    y: Array((activeData.ohlcv || []).length).fill(activeData.entry),
+                    type: "scatter", mode: "lines", name: "Entry",
+                    line: { color: "#c084fc", width: 1.5, dash: "dash" }, hoverinfo: "skip",
                   }] : []),
                 ]}
                 layout={{
                   autosize: true,
-                  height: 350,
-                  margin: { t: 30, r: 30, l: 40, b: 40 },
-                  paper_bgcolor: '#18181b',
-                  plot_bgcolor: '#18181b',
-                  font: { color: '#fff' },
-                  hoverdistance: 5,
-                  spikedistance: 5,
-                  xaxis: {
-                    title: 'Date',
-                    tickformat: '%m-%d',
-                    showgrid: true,
-                    gridcolor: '#444',
-                    type: 'date',
-                  },
-                  yaxis: {
-                    title: 'Price',
-                    showgrid: true,
-                    gridcolor: '#444',
-                  },
-                  legend: { orientation: 'h', y: -0.2 },
+                  height: 380,
+                  margin: { t: 20, r: 20, l: 50, b: 50 },
+                  paper_bgcolor: "#18181b",
+                  plot_bgcolor: "#18181b",
+                  font: { color: "#fff", size: 11 },
+                  xaxis: { title: "Date", tickformat: "%m/%d", showgrid: true, gridcolor: "#333", type: "date" },
+                  yaxis: { title: "Price", showgrid: true, gridcolor: "#333" },
+                  legend: { orientation: "h", y: -0.18, font: { size: 10 } },
                 }}
                 useResizeHandler={true}
-                style={{ width: '100%', height: '100%' }}
+                style={{ width: "100%", height: "100%" }}
                 config={{ displayModeBar: false }}
               />
             </div>
           </CardContent>
         </Card>
 
-        {/* SPY–QQQ Convergence/Divergence Box (15m only) */}
-        {backendData?.intervals?.["15m"] && (
-          <Card className="bg-neutral-900 border-neutral-700">
-            <CardHeader>
-              <CardTitle className="flex items-center space-x-2">
-                <BarChart3 className="w-4 h-4 text-yellow-400" />
-                <span>SPY–QQQ Convergence/Divergence (15m)</span>
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {backendData.intervals["15m"].spy_pct_change !== undefined && backendData.intervals["15m"].qqq_pct_change !== undefined ? (
-                <div className="flex flex-col md:flex-row md:items-center md:space-x-8 space-y-2 md:space-y-0 text-sm">
-                  <span>
-                    <span className="text-neutral-400">SPY % Change (3 bars): </span>
-                    <span className={backendData.intervals["15m"].spy_pct_change > 0 ? "text-emerald-400" : backendData.intervals["15m"].spy_pct_change < 0 ? "text-rose-400" : "text-white"}>
-                      {(backendData.intervals["15m"].spy_pct_change * 100).toFixed(2)}%
-                    </span>
-                  </span>
-                  <span>
-                    <span className="text-neutral-400">QQQ % Change (3 bars): </span>
-                    <span className={backendData.intervals["15m"].qqq_pct_change > 0 ? "text-emerald-400" : backendData.intervals["15m"].qqq_pct_change < 0 ? "text-rose-400" : "text-white"}>
-                      {(backendData.intervals["15m"].qqq_pct_change * 100).toFixed(2)}%
-                    </span>
-                  </span>
-                  <span>
-                    <span className="text-neutral-400">Status: </span>
-                    {backendData.intervals["15m"].convergence_status === "convergent" && <span className="text-emerald-400 font-bold">Convergent &#x2714;</span>}
-                    {backendData.intervals["15m"].convergence_status === "divergent" && <span className="text-yellow-300 font-bold">Divergent &#9888;</span>}
-                    {backendData.intervals["15m"].convergence_status === "neutral" && <span className="text-white">Neutral</span>}
-                  </span>
-                  {backendData.intervals["15m"].leader && (
-                    <span>
-                      <span className="text-neutral-400">Leader: </span>
-                      <span className="font-bold text-white">{backendData.intervals["15m"].leader}</span>
-                      <span className={backendData.intervals["15m"].leader_direction === "up" ? "text-emerald-400 ml-1" : backendData.intervals["15m"].leader_direction === "down" ? "text-rose-400 ml-1" : "ml-1"}>
-                        {backendData.intervals["15m"].leader_direction === "up" ? <>&uarr;</> : backendData.intervals["15m"].leader_direction === "down" ? <>&darr;</> : null}
-                      </span>
-                    </span>
-                  )}
-                  {backendData.intervals["15m"].signal_agrees_with_leader !== null && backendData.intervals["15m"].signal_agrees_with_leader !== undefined && (
-                    <span>
-                      <span className="text-neutral-400">Signal Agrees with Leader: </span>
-                      {backendData.intervals["15m"].signal_agrees_with_leader ? (
-                        <span className="text-emerald-400 font-bold">Yes &#x2714;</span>
-                      ) : (
-                        <span className="text-rose-400 font-bold">No &#10060;</span>
-                      )}
-                    </span>
-                  )}
-                </div>
-              ) : (
-                <div className="text-neutral-400">No SPY–QQQ convergence data available.</div>
-              )}
-            </CardContent>
-          </Card>
-        )}
       </div>
     </div>
   )
