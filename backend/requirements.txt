@@ -3,8 +3,7 @@ matplotlib
 pandas
 numpy
 scikit-learn
-yfinance
 fastapi
 uvicorn[standard]
 pydantic
-python-multipart
+python-multipartpython-dotenv
