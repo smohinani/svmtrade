@@ -53,171 +53,124 @@ def clean_tradier_data(raw_data: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_market_data(symbol: str, interval: str = '1h', period: str = '30d') -> pd.DataFrame:
     """
-    Fetch market data using Tradier API.
+    Fetch OHLCV data from Tradier.
+
+    Routing:
+      1m / 5m / 15m      → /markets/timesales
+      1h / 4h            → /markets/timesales with 15min bars, resampled
+      1d                 → /markets/history
 
     Args:
         symbol: Ticker symbol
-        interval: Interval ('1min', '5min', '15min', '1hour', 'daily')
+        interval: Interval string ('1m','5m','15m','1h','4h','1d')
         period: Duration (e.g., '30d' = 30 days)
 
     Returns:
         Cleaned DataFrame with OHLCV data
     """
     print(f"[INFO] Fetching {symbol} ({interval}, {period}) via Tradier API...")
-    
-    # Convert period to start/end dates
-    end_date = datetime.now()
-    
-    # Parse period
+
+    end_dt = datetime.now()
     if period.endswith('d'):
-        days = int(period[:-1])
-        start_date = end_date - timedelta(days=days)
+        start_dt = end_dt - timedelta(days=int(period[:-1]))
     elif period.endswith('mo'):
-        months = int(period[:-2])
-        start_date = end_date - timedelta(days=months*30)
+        start_dt = end_dt - timedelta(days=int(period[:-2]) * 30)
     elif period.endswith('y'):
-        years = int(period[:-1])
-        start_date = end_date - timedelta(days=years*365)
+        start_dt = end_dt - timedelta(days=int(period[:-1]) * 365)
     else:
-        start_date = end_date - timedelta(days=30)  # default 30 days
-    
-    # Convert interval to Tradier format
-    interval_map = {
-        '1m': '1min',
-        '5m': '5min', 
-        '15m': '15min',
-        '1h': '1hour',
-        '1d': 'daily'
-    }
-    tradier_interval = interval_map.get(interval, '1hour')
-    
-    # API call
-    url = f"{TRADIER_BASE_URL}/markets/history"
-    headers = {
-        'Authorization': f'Bearer {TRADIER_TOKEN}',
-        'Accept': 'application/json'
-    }
-    params = {
-        'symbol': symbol,
-        'interval': tradier_interval,
-        'start': start_date.strftime('%Y-%m-%d'),
-        'end': end_date.strftime('%Y-%m-%d')
-    }
-    
+        start_dt = end_dt - timedelta(days=30)
+
+    headers = {'Authorization': f'Bearer {TRADIER_TOKEN}', 'Accept': 'application/json'}
+
     try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if 'history' not in data or 'day' not in data['history']:
-            print(f"[WARNING] No data returned for {symbol}")
-            return pd.DataFrame()
-        
-        # Parse the data
-        records = []
-        for day_data in data['history']['day']:
-            date = day_data['date']
-            if 'bar' in day_data:
-                for bar in day_data['bar']:
-                    records.append({
-                        'date': f"{date} {bar['time']}",
-                        'open': float(bar['open']),
-                        'high': float(bar['high']),
-                        'low': float(bar['low']),
-                        'close': float(bar['close']),
-                        'volume': int(bar['volume'])
-                    })
-            else:
-                # Daily data
-                records.append({
-                    'date': date,
-                    'open': float(day_data['open']),
-                    'high': float(day_data['high']),
-                    'low': float(day_data['low']),
-                    'close': float(day_data['close']),
-                    'volume': int(day_data['volume'])
-                })
-        
-        if not records:
-            print(f"[WARNING] No records found for {symbol}")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(records)
-        df = clean_tradier_data(df)
-        
-        print(f"[SUCCESS] Fetched {len(df)} records for {symbol}")
+        if interval in ('1m', '5m', '15m', '1h', '4h'):
+            ts_interval = {'1m': '1min', '5m': '5min', '15m': '15min', '1h': '15min', '4h': '15min'}[interval]
+            params = {
+                'symbol': symbol,
+                'interval': ts_interval,
+                'start': start_dt.strftime('%Y-%m-%d %H:%M'),
+                'end': end_dt.strftime('%Y-%m-%d %H:%M'),
+                'session_filter': 'open',
+            }
+            resp = requests.get(f'{TRADIER_BASE_URL}/markets/timesales',
+                                headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            raw = resp.json()
+
+            series = raw.get('series') or {}
+            if not series or series == 'null':
+                print(f'[WARNING] No timesales data for {symbol}')
+                return pd.DataFrame()
+
+            items = series.get('data', [])
+            if isinstance(items, dict):
+                items = [items]
+            if not items:
+                return pd.DataFrame()
+
+            df = pd.DataFrame([{
+                'Date': pd.to_datetime(item['time']),
+                'Open':   float(item.get('open',  item.get('price', 0))),
+                'High':   float(item.get('high',  item.get('price', 0))),
+                'Low':    float(item.get('low',   item.get('price', 0))),
+                'Close':  float(item.get('close', item.get('price', 0))),
+                'Volume': int(item.get('volume', 0)),
+            } for item in items])
+            df.set_index('Date', inplace=True)
+            df = df[~df.index.duplicated(keep='last')].sort_index()
+
+            if interval in ('1h', '4h'):
+                rule = '1h' if interval == '1h' else '4h'
+                df = df.resample(rule).agg(
+                    Open=('Open', 'first'), High=('High', 'max'),
+                    Low=('Low', 'min'), Close=('Close', 'last'),
+                    Volume=('Volume', 'sum')
+                ).dropna(subset=['Close'])
+
+        else:
+            params = {
+                'symbol': symbol,
+                'interval': 'daily',
+                'start': start_dt.strftime('%Y-%m-%d'),
+                'end': end_dt.strftime('%Y-%m-%d'),
+            }
+            resp = requests.get(f'{TRADIER_BASE_URL}/markets/history',
+                                headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            raw = resp.json()
+
+            hist = raw.get('history') or {}
+            if not hist or 'day' not in hist:
+                print(f'[WARNING] No history data for {symbol}')
+                return pd.DataFrame()
+
+            days = hist['day']
+            if isinstance(days, dict):
+                days = [days]
+
+            df = pd.DataFrame([{
+                'Date':   pd.to_datetime(d['date']),
+                'Open':   float(d['open']),
+                'High':   float(d['high']),
+                'Low':    float(d['low']),
+                'Close':  float(d['close']),
+                'Volume': int(d.get('volume', 0)),
+            } for d in days])
+            df.set_index('Date', inplace=True)
+            df = df.sort_index()
+
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        print(f'[SUCCESS] Fetched {len(df)} bars for {symbol} ({interval})')
         return df
-        
+
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Failed to fetch data: {e}")
+        print(f'[ERROR] Tradier request failed: {e}')
         return pd.DataFrame()
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
+        print(f'[ERROR] Unexpected error fetching {symbol}: {e}')
         return pd.DataFrame()
-
-# Keep the rest of the original functions...
-# (The rest of the file remains the same)
-        raw_data.index = raw_data.index.tz_localize(None)
-
-    return raw_data
-
-def fetch_market_data(symbol: str, interval: str = '1h', period: str = '30d') -> pd.DataFrame:
-    """
-    Fetch market data using the raw Yahoo Finance API directly with browser headers.
-
-    Args:
-        symbol: Ticker symbol
-        interval: Interval ('1m', '5m', '15m', '1h', '1d', etc.)
-        period: Duration (e.g., '30d' = 30 days)
-
-    Returns:
-        Cleaned DataFrame with OHLCV data
-    """
-    print(f"[INFO] Fetching {symbol} ({interval}, {period}) via raw Yahoo API...")
-
-    range_days = int(period.replace('d', '')) if 'd' in period else 30
-    end = int(time.time())
-    start = end - range_days * 86400
-
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?period1={start}&period2={end}&interval={interval}&events=history"
-    )
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    session = curl_requests.Session(impersonate="chrome")
-    response = session.get(url, headers=headers)
-    if response.status_code != 200:
-        raise ValueError(f"[ERROR] Yahoo API fetch failed: HTTP {response.status_code}")
-
-    data = response.json()
-    try:
-        timestamps = data["chart"]["result"][0]["timestamp"]
-        indicators = data["chart"]["result"][0]["indicators"]["quote"][0]
-
-        df = pd.DataFrame({
-            "Date": [datetime.fromtimestamp(ts) for ts in timestamps],
-            "Open": indicators["open"],
-            "High": indicators["high"],
-            "Low": indicators["low"],
-            "Close": indicators["close"],
-            "Volume": indicators["volume"]
-        }).set_index("Date")
-
-        df = clean_yf_data(df)
-        print(f"[SUCCESS] Raw Yahoo API returned shape: {df.shape}")
-        return df
-
-    except Exception as e:
-        raise ValueError(f"[ERROR] Failed to parse raw Yahoo data: {e}")
-
 
 def smooth_data(series, method='savgol', window=21, poly=3):
     """
