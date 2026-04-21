@@ -11,19 +11,10 @@ const nextConfig = {
   },
   webpack: (config, { isServer }) => {
     if (!isServer) {
-      config.resolve.fallback = {
-        ...config.resolve.fallback,
-        fs: false,
-      };
+      config.resolve.fallback = { ...config.resolve.fallback, fs: false };
     }
-    config.plugins.push(
-      new config.webpack.DefinePlugin({
-        'self': 'globalThis',
-      })
-    );
     return config;
   },
 };
 
-export default nextConfig;
 export default nextConfig;
