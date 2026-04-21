@@ -1,0 +1,535 @@
+"""
+Enhanced Wave Detection Module
+
+This module provides advanced functionality for detecting and analyzing wave patterns
+in financial time series data. It includes adaptive parameter selection based on
+volatility, multi-timeframe confirmation, and confidence scoring for detected pivots.
+
+Dependencies: numpy, pandas, scipy, curl_cffi, requests
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.signal import argrelextrema, savgol_filter
+from typing import Dict, Tuple, List, Union, Optional
+from curl_cffi import requests as curl_requests
+import requests as real_requests
+import time
+from datetime import datetime
+from config import DEFAULT_SYMBOL as symbol
+
+# Local cleaning function (avoid circular import)
+def clean_yf_data(raw_data: pd.DataFrame) -> pd.DataFrame:
+    if raw_data.empty:
+        raise ValueError("Downloaded data is empty.")
+
+    raw_data.columns = [col.capitalize() for col in raw_data.columns]
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing = [col for col in required_cols if col not in raw_data.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+
+    if raw_data.index.tz is not None:
+        raw_data.index = raw_data.index.tz_localize(None)
+
+    return raw_data
+
+def fetch_market_data(symbol: str, interval: str = '1h', period: str = '30d') -> pd.DataFrame:
+    """
+    Fetch market data using the raw Yahoo Finance API directly with browser headers.
+
+    Args:
+        symbol: Ticker symbol
+        interval: Interval ('1m', '5m', '15m', '1h', '1d', etc.)
+        period: Duration (e.g., '30d' = 30 days)
+
+    Returns:
+        Cleaned DataFrame with OHLCV data
+    """
+    print(f"[INFO] Fetching {symbol} ({interval}, {period}) via raw Yahoo API...")
+
+    range_days = int(period.replace('d', '')) if 'd' in period else 30
+    end = int(time.time())
+    start = end - range_days * 86400
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?period1={start}&period2={end}&interval={interval}&events=history"
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    session = curl_requests.Session(impersonate="chrome")
+    response = session.get(url, headers=headers)
+    if response.status_code != 200:
+        raise ValueError(f"[ERROR] Yahoo API fetch failed: HTTP {response.status_code}")
+
+    data = response.json()
+    try:
+        timestamps = data["chart"]["result"][0]["timestamp"]
+        indicators = data["chart"]["result"][0]["indicators"]["quote"][0]
+
+        df = pd.DataFrame({
+            "Date": [datetime.fromtimestamp(ts) for ts in timestamps],
+            "Open": indicators["open"],
+            "High": indicators["high"],
+            "Low": indicators["low"],
+            "Close": indicators["close"],
+            "Volume": indicators["volume"]
+        }).set_index("Date")
+
+        df = clean_yf_data(df)
+        print(f"[SUCCESS] Raw Yahoo API returned shape: {df.shape}")
+        return df
+
+    except Exception as e:
+        raise ValueError(f"[ERROR] Failed to parse raw Yahoo data: {e}")
+
+
+def smooth_data(series, method='savgol', window=21, poly=3):
+    """
+    Smooth time series data using various methods.
+    
+    Args:
+        series: Time series data
+        method: Smoothing method ('savgol', 'ewm', or 'sma')
+        window: Window size for smoothing
+        poly: Polynomial order for Savitzky-Golay filter
+        
+    Returns:
+        Smoothed series
+    """
+    # Ensure window size is valid (must be odd and less than data length)
+    data_length = len(series)
+    if window >= data_length:
+        window = min(data_length - 1, 11)  # Use smaller window
+        if window % 2 == 0:  # Ensure window is odd
+            window -= 1
+        print(f"Adjusted smoothing window to {window} due to data length constraints")
+    
+    if method == 'savgol':
+        return pd.Series(
+            savgol_filter(series.values, window, poly),
+            index=series.index
+        )
+    elif method == 'ewm':
+        return series.ewm(span=window).mean()
+    elif method == 'sma':
+        return series.rolling(window=window, center=True).mean()
+    else:
+        return series
+
+
+def calculate_adaptive_order(data: pd.DataFrame, base_order: int = 5, 
+                            volatility_col: str = 'Volatility',
+                            min_order: int = 3, max_order: int = 10) -> int:
+    """
+    Calculate an adaptive order parameter based on market volatility.
+    
+    Higher volatility -> lower order (more sensitive to detect more pivots)
+    Lower volatility -> higher order (less sensitive to filter out noise)
+    
+    Args:
+        data: DataFrame with market data including volatility
+        base_order: Base order parameter
+        volatility_col: Column name for volatility
+        min_order: Minimum order value
+        max_order: Maximum order value
+        
+    Returns:
+        Adaptive order parameter
+    """
+    if volatility_col not in data.columns or data[volatility_col].isna().all():
+        return base_order
+        
+    # Get the most recent volatility value
+    current_volatility = data[volatility_col].dropna().iloc[-1]
+    
+    # Calculate historical volatility percentile
+    vol_series = data[volatility_col].dropna()
+    if len(vol_series) <= 1:
+        return base_order
+        
+    percentile = (vol_series.rank(pct=True).iloc[-1])
+    
+    # Inverse relationship: high volatility -> lower order
+    adaptive_order = int(base_order - (percentile * (base_order - min_order)))
+    
+    # Ensure order is within bounds
+    return max(min_order, min(adaptive_order, max_order))
+
+
+def detect_waves(data: pd.DataFrame, column: str = 'Close', 
+                base_order: int = 5, adaptive: bool = True,
+                smooth_method: str = 'savgol', smooth_kwargs: Dict = None) -> Dict:
+    """
+    Detect waves (peaks and troughs) in time series data with enhanced accuracy.
+    
+    Args:
+        data: DataFrame with market data
+        column: Column name to analyze
+        base_order: Base order parameter for extrema detection
+        adaptive: Whether to use adaptive order based on volatility
+        smooth_method: Method for data smoothing
+        smooth_kwargs: Additional parameters for smoothing
+        
+    Returns:
+        Dictionary with wave detection results
+    """
+    if smooth_kwargs is None:
+        smooth_kwargs = {'window': 11, 'poly': 3}
+    
+    # Apply smoothing to reduce noise
+    smooth_series = data[column].rolling(window=5, center=True).mean().fillna(data[column])
+    
+    # Calculate adaptive order if requested
+    if adaptive:
+        order = calculate_adaptive_order(data, base_order)
+        print(f"Using adaptive order: {order}")
+    else:
+        order = base_order
+    
+    # Get numpy arrays for calculations
+    values = smooth_series.values
+    dates = data.index.values
+    
+    # Find local maxima (peaks)
+    peaks_indices = argrelextrema(values, np.greater, order=order)[0]
+    
+    # Find local minima (troughs)
+    troughs_indices = argrelextrema(values, np.less, order=order)[0]
+    
+    # Create arrays for peaks and troughs
+    peaks_dates = dates[peaks_indices]
+    peaks_values = values[peaks_indices]
+    
+    troughs_dates = dates[troughs_indices]
+    troughs_values = values[troughs_indices]
+    
+    # Combine all pivot points
+    all_pivot_indices = np.sort(np.concatenate([peaks_indices, troughs_indices]))
+    all_pivot_dates = dates[all_pivot_indices]
+    all_pivot_values = values[all_pivot_indices]
+    
+    # Create a simple array to indicate if each pivot is a peak (1) or trough (-1)
+    pivot_types = np.zeros(len(all_pivot_indices))
+    for i, idx in enumerate(all_pivot_indices):
+        if idx in peaks_indices:
+            pivot_types[i] = 1  # Peak
+        else:
+            pivot_types[i] = -1  # Trough
+    
+    # Calculate wave heights (absolute difference between consecutive pivots)
+    wave_heights = np.zeros(len(all_pivot_indices))
+    for i in range(1, len(all_pivot_indices)):
+        current_value = float(all_pivot_values[i])
+        prev_value = float(all_pivot_values[i-1])
+        wave_heights[i] = abs(current_value - prev_value)
+    
+    return {
+        'dates': dates,
+        'values': values,
+        'smooth_values': smooth_series.values,
+        'peaks_indices': peaks_indices,
+        'troughs_indices': troughs_indices,
+        'all_pivot_indices': all_pivot_indices,
+        'all_pivot_dates': all_pivot_dates,
+        'all_pivot_values': all_pivot_values,
+        'pivot_types': pivot_types,
+        'wave_heights': wave_heights,
+        'order_used': order
+    }
+
+
+def calculate_wave_metrics(wave_data: Dict, data: pd.DataFrame) -> Dict:
+    """
+    Calculate additional metrics for detected waves.
+    
+    Args:
+        wave_data: Dictionary with wave detection results
+        data: Original DataFrame with market data
+        
+    Returns:
+        Dictionary with additional wave metrics
+    """
+    all_pivot_indices = wave_data['all_pivot_indices']
+    all_pivot_values = wave_data['all_pivot_values']
+    pivot_types = wave_data['pivot_types']
+    
+    # Initialize arrays for metrics
+    wave_durations = np.zeros(len(all_pivot_indices))
+    wave_slopes = np.zeros(len(all_pivot_indices))
+    wave_volumes = np.zeros(len(all_pivot_indices))
+    
+    # Calculate metrics for each wave
+    for i in range(1, len(all_pivot_indices)):
+        # Duration (number of bars)
+        wave_durations[i] = all_pivot_indices[i] - all_pivot_indices[i-1]
+        
+        # Slope (price change per bar)
+        if wave_durations[i] > 0:
+            wave_slopes[i] = (all_pivot_values[i] - all_pivot_values[i-1]) / wave_durations[i]
+        
+        # Volume (if available)
+        if 'Volume' in data.columns:
+            start_idx = all_pivot_indices[i-1]
+            end_idx = all_pivot_indices[i]
+            if start_idx < len(data) and end_idx < len(data):
+                wave_volumes[i] = data['Volume'].iloc[start_idx:end_idx+1].sum()
+    
+    # Add metrics to wave data
+    wave_data['wave_durations'] = wave_durations
+    wave_data['wave_slopes'] = wave_slopes
+    wave_data['wave_volumes'] = wave_volumes
+    
+    return wave_data
+
+
+def calculate_pivot_confidence(wave_data: Dict, data: pd.DataFrame) -> Dict:
+    """
+    Calculate confidence scores for detected pivots.
+    
+    Higher confidence for:
+    - Larger wave heights
+    - Pivots confirmed by multiple timeframes
+    - Pivots with higher volume
+    - Pivots with steeper slopes
+    
+    Args:
+        wave_data: Dictionary with wave detection results
+        data: Original DataFrame with market data
+        
+    Returns:
+        Dictionary with added confidence scores
+    """
+    all_pivot_indices = wave_data['all_pivot_indices']
+    wave_heights = wave_data['wave_heights']
+    
+    # Initialize confidence scores
+    confidence_scores = np.zeros(len(all_pivot_indices))
+    
+    if len(all_pivot_indices) <= 1:
+        wave_data['confidence_scores'] = confidence_scores
+        return wave_data
+    
+    # Normalize wave heights to 0-1 scale for confidence component
+    max_height = np.max(wave_heights[1:])
+    if max_height > 0:
+        height_scores = wave_heights / max_height
+    else:
+        height_scores = np.zeros_like(wave_heights)
+    
+    # Use wave metrics for confidence if available
+    if 'wave_slopes' in wave_data:
+        slopes = np.abs(wave_data['wave_slopes'])
+        max_slope = np.max(slopes[1:]) if len(slopes) > 1 else 1
+        if max_slope > 0:
+            slope_scores = slopes / max_slope
+        else:
+            slope_scores = np.zeros_like(slopes)
+    else:
+        slope_scores = np.zeros_like(wave_heights)
+    
+    if 'wave_volumes' in wave_data and np.sum(wave_data['wave_volumes']) > 0:
+        volumes = wave_data['wave_volumes']
+        max_volume = np.max(volumes[1:]) if len(volumes) > 1 else 1
+        if max_volume > 0:
+            volume_scores = volumes / max_volume
+        else:
+            volume_scores = np.zeros_like(volumes)
+    else:
+        volume_scores = np.zeros_like(wave_heights)
+    
+    # Combine factors for overall confidence score
+    # Weights can be adjusted based on importance
+    height_weight = 0.5
+    slope_weight = 0.3
+    volume_weight = 0.2
+    
+    confidence_scores = (
+        height_weight * height_scores +
+        slope_weight * slope_scores +
+        volume_weight * volume_scores
+    )
+    
+    # Ensure first pivot has a reasonable confidence
+    if len(confidence_scores) > 0:
+        confidence_scores[0] = np.mean(confidence_scores[1:]) if len(confidence_scores) > 1 else 0.5
+    
+    wave_data['confidence_scores'] = confidence_scores
+    return wave_data
+
+
+def detect_waves_multi_timeframe(symbol: str, primary_interval: str = '1h',
+                               confirm_intervals: List[str] = None,
+                               period: str = '30d', column: str = 'Close',
+                               base_order: int = 5) -> Dict:
+    """
+    Detect waves across multiple timeframes for confirmation.
+    
+    Args:
+        symbol: Ticker symbol
+        primary_interval: Primary interval for analysis
+        confirm_intervals: List of intervals for confirmation
+        period: Data period
+        column: Column name to analyze
+        base_order: Base order parameter
+        
+    Returns:
+        Dictionary with multi-timeframe wave detection results
+    """
+    if confirm_intervals is None:
+        confirm_intervals = ['4h', '1d']
+    
+    # Fetch and analyze primary timeframe
+    primary_data = fetch_market_data(symbol, interval=primary_interval, period=period)
+    primary_waves = detect_waves(primary_data, column=column, base_order=base_order)
+    primary_waves = calculate_wave_metrics(primary_waves, primary_data)
+    primary_waves = calculate_pivot_confidence(primary_waves, primary_data)
+    
+    # Store results for all timeframes
+    results = {
+        'primary': {
+            'interval': primary_interval,
+            'data': primary_data,
+            'waves': primary_waves
+        },
+        'confirmations': []
+    }
+    
+    # Analyze confirmation timeframes
+    for interval in confirm_intervals:
+        confirm_data = fetch_market_data(symbol, interval=interval, period=period)
+        confirm_waves = detect_waves(confirm_data, column=column, base_order=base_order)
+        confirm_waves = calculate_wave_metrics(confirm_waves, confirm_data)
+        confirm_waves = calculate_pivot_confidence(confirm_waves, confirm_data)
+        
+        results['confirmations'].append({
+            'interval': interval,
+            'data': confirm_data,
+            'waves': confirm_waves
+        })
+    
+    return results
+
+
+def get_latest_pivot(wave_data: Dict) -> Dict:
+    """
+    Get the most recent pivot point from wave data.
+    
+    Args:
+        wave_data: Dictionary with wave detection results
+        
+    Returns:
+        Dictionary with latest pivot information
+    """
+    if len(wave_data['all_pivot_indices']) == 0:
+        return None
+    
+    # Get the index of the last pivot
+    last_idx = -1
+    
+    # Extract information about the last pivot
+    pivot_index = wave_data['all_pivot_indices'][last_idx]
+    pivot_date = wave_data['all_pivot_dates'][last_idx]
+    pivot_value = wave_data['all_pivot_values'][last_idx]
+    pivot_type = wave_data['pivot_types'][last_idx]
+    pivot_type_name = "Peak" if pivot_type == 1 else "Trough"
+    
+    # Get confidence if available
+    confidence = wave_data.get('confidence_scores', [0.5])[last_idx]
+    
+    return {
+        'index': pivot_index,
+        'date': pivot_date,
+        'value': pivot_value,
+        'type': pivot_type,
+        'type_name': pivot_type_name,
+        'confidence': confidence
+    }
+
+
+def predict_next_pivot_simple(wave_data: Dict) -> Dict:
+    """
+    Make a simple prediction of the next pivot based on alternating pattern.
+    This is a baseline prediction before applying the SVM model.
+    
+    Args:
+        wave_data: Dictionary with wave detection results
+        
+    Returns:
+        Dictionary with next pivot prediction
+    """
+    if len(wave_data['all_pivot_indices']) < 2:
+        return None
+    
+    # Get the last pivot
+    last_pivot = get_latest_pivot(wave_data)
+    
+    # Predict opposite type for next pivot (alternating pattern)
+    next_type = -1 if last_pivot['type'] == 1 else 1
+    next_type_name = "Peak" if next_type == 1 else "Trough"
+    
+    # Calculate average wave duration and height for estimation
+    durations = wave_data.get('wave_durations', [])
+    heights = wave_data.get('wave_heights', [])
+    
+    if len(durations) > 1 and len(heights) > 1:
+        # Use recent waves for better estimation (last 5 or fewer)
+        recent_count = min(5, len(durations) - 1)
+        avg_duration = np.mean(durations[-recent_count:])
+        avg_height = np.mean(heights[-recent_count:])
+    else:
+        avg_duration = 5  # Default if not enough data
+        avg_height = 0.01 * last_pivot['value']  # Default 1% move
+    
+    # Estimate next pivot date/index
+    last_index = last_pivot['index']
+    estimated_next_index = last_index + avg_duration
+    
+    # Estimate next pivot value
+    last_value = last_pivot['value']
+    if next_type == 1:  # Peak
+        estimated_next_value = last_value + avg_height
+    else:  # Trough
+        estimated_next_value = last_value - avg_height
+    
+    return {
+        'predicted_type': next_type,
+        'predicted_type_name': next_type_name,
+        'estimated_index_offset': avg_duration,
+        'estimated_value': estimated_next_value,
+        'confidence': 0.5,  # Default confidence for simple prediction
+        'method': 'alternating_pattern'
+    }
+
+
+# Example usage
+if __name__ == "__main__":
+    # Test the wave detection module
+    data = fetch_market_data(symbol, interval='1h', period='30d')
+    
+    print(f"Fetched {len(data)} data points for {symbol}")
+    
+    # Detect waves
+    wave_data = detect_waves(data)
+    wave_data = calculate_wave_metrics(wave_data, data)
+    wave_data = calculate_pivot_confidence(wave_data, data)
+    
+    # Print summary
+    print(f"Detected {len(wave_data['peaks_indices'])} peaks and {len(wave_data['troughs_indices'])} troughs")
+    
+    # Get latest pivot
+    latest_pivot = get_latest_pivot(wave_data)
+    if latest_pivot:
+        print(f"Latest pivot: {latest_pivot['type_name']} at {latest_pivot['date']} with value {latest_pivot['value']:.2f}")
+    
+    # Make simple prediction
+    next_pivot = predict_next_pivot_simple(wave_data)
+    if next_pivot:
+        print(f"Simple prediction for next pivot: {next_pivot['predicted_type_name']} with estimated value {next_pivot['estimated_value']:.2f}")
